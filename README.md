@@ -1,6 +1,6 @@
 Collecting workspace information
 
-```markdown
+
 # RAGGAE
 
 RAGGAE is a Python-based project designed to facilitate the storage, retrieval, and summarization of documents using advanced language models and vector stores. The project leverages various libraries and tools to process and manage documents efficiently.
@@ -54,7 +54,6 @@ from ragstore import RAGStore
 
 ragstore = RAGStore()
 ragstore.add_file('path/to/your/file.txt')
-```
 
 ### Adding a Folder
 
