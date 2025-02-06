@@ -1,47 +1,39 @@
-import base64
-
+import os
+import zlib
+import time
+from pathlib import Path
+from typing import Tuple, Callable
+from loguru import logger
+import tiktoken
 # Hash
 import hashlib
-import os
-import time
-import zlib
-from pathlib import Path
-import shutil 
-from typing import Tuple, List
-import numpy as np
-# Concurrent
-from concurrent.futures import ThreadPoolExecutor, as_completed
-
-import tiktoken
-from langchain.chains.summarize import load_summarize_chain
-from langchain_community.callbacks.manager import get_openai_callback
-from langchain_community.document_loaders import UnstructuredPDFLoader
-
-# Langchain
-from langchain_core.documents import Document
-from langchain_core.output_parsers import StrOutputParser
-from langchain_core.prompt_values import ChatPromptValue, StringPromptValue
-from langchain_core.prompts import ChatPromptTemplate, PromptTemplate
-from langchain_core.runnables import RunnableLambda, RunnablePassthrough
-from langchain_openai import ChatOpenAI, OpenAIEmbeddings
-from loguru import logger
-from openai import OpenAIError, RateLimitError
-# Image management
-from PIL import Image
-
+import base64
 # Unstructured
 from unstructured.partition.auto import partition
-
-from document_store import DocumentStore
+from unstructured.documents.elements import Text, Image, Title, Table, FigureCaption, NarrativeText
+# Concurrent
+from concurrent.futures import ThreadPoolExecutor, as_completed
+# Langchain
+from langchain_core.documents import Document
+from langchain_core.messages import HumanMessage
+from langchain_core.output_parsers import StrOutputParser
+from langchain_core.prompts import PromptTemplate, ChatPromptTemplate, MessagesPlaceholder, SystemMessagePromptTemplate, HumanMessagePromptTemplate
+from langchain_core.prompt_values import ChatPromptValue, StringPromptValue
+from langchain_core.runnables import RunnablePassthrough, RunnableLambda
+from langchain_openai import ChatOpenAI, OpenAIEmbeddings
+from langchain_community.callbacks.manager import get_openai_callback
+from langchain.chains.summarize import load_summarize_chain
+from openai import RateLimitError,Timeout, APIError, APIConnectionError, OpenAIError
+from openai import BadRequestError
 
 # retry
 from retry import retry
-
 # local classes
 from vector_store import VectorStore
+from document_store import DocumentStore
 
 
-class RAGStore:
+class RAGStore():
     """
     A class to handle the storage and processing of documents using a Retrieval-Augmented Generation (RAG) approach.
     Attributes:
@@ -62,11 +54,10 @@ class RAGStore:
         calculate_crc32(file_path: str | Path) -> int:
             Calculates the CRC32 hash of a file.
     """
-
+    
     RAG_PREFIX = "RAGGAE"
-    TMPDIR = './tmp'
-
-    def __init__(self, llm: str = "OpenAI", debug: bool = False, imgsize:Tuple[int,int]=(200,150)):
+    
+    def __init__(self, llm:str='OpenAI', debug:bool=False):
         """
         Initializes the RagStore class.
         Args:
@@ -82,30 +73,24 @@ class RAGStore:
         # LLM
         self._llm_type = llm
         match llm:
-            case "OpenAI":
+            case 'OpenAI':
                 embedding_model = os.getenv("OPENAI_EMBEDDING_MODEL")
                 if not embedding_model:
-                    embedding_model = "text-embedding-3-small"
+                    embedding_model = 'text-embedding-3-small'
                 embedding_function = OpenAIEmbeddings(model=embedding_model)
 
         # An instance of the DocumentStore class
         try:
-            self._document_store = DocumentStore(
-                host="redis", idx_prefix=self.RAG_PREFIX
-            )
+            self._document_store = DocumentStore(host='redis', idx_prefix=self.RAG_PREFIX)
         except Exception:
             try:
-                self._document_store = DocumentStore(
-                    host="localhost", idx_prefix=self.RAG_PREFIX
-                )
+                self._document_store = DocumentStore(host='localhost', idx_prefix=self.RAG_PREFIX)
             except ConnectionError:
                 logger.error("Could not connect to the document store")
                 return None
         # The vectorstore to use to index the summaries and their embeddings
         self._vector_store = VectorStore(embedding_function=embedding_function)
-        # Max number of pixels in images
-        self._imgsize = imgsize[0]*imgsize[1]
-
+    
     def get_summariser(self):
         """
         Retrieves the summariser instance based on the LLM (Large Language Model) type.
@@ -115,12 +100,12 @@ class RAGStore:
             ValueError: If the LLM type is not recognized.
         """
         match self._llm_type:
-            case "OpenAI":
+            case 'OpenAI':
                 summariser_model = os.getenv("OPENAI_SUMMARISER_MODEL")
                 if not summariser_model:
-                    summariser_model = "gpt-4o-mini"
+                    summariser_model = 'gpt-4o-mini'
                 return OpenAISummariser(model=summariser_model, debug=self._debug)
-
+    
     def get_vector_store(self):
         """
         Retrieves the vector store instance.
@@ -128,16 +113,16 @@ class RAGStore:
             VectorStore: An instance of the VectorStore class.
         """
         return self._vector_store
-
+    
     def get_document_store(self):
         """
         Retrieves the document store instance.
         Returns:
             VectorStore: An instance of the VectorStore class.
         """
-        return self._document_store
-
-    def add_file(self, fn: str | Path, overwrite: bool = False, purge_folder:bool=True) -> Tuple[str, dict]:
+        return self._document_store        
+    
+    def add_file(self, fn:str|Path, store:bool=True, overwrite:bool=False)->Tuple[str, dict]:
         """
         Adds a file to the document store and vector store after processing its contents.
         Args:
@@ -155,135 +140,108 @@ class RAGStore:
             - Documents are stored in the document store, and summaries are stored in the vector store.
         """
         start = time.time()
-        # Empty the TMPDIR folder before processing
-        if purge_folder:
-            if Path(self.TMPDIR).exists():
-                shutil.rmtree(self.TMPDIR)
         logger.info(f"Processing of file {fn} starts")
         if isinstance(fn, str):
             fn = Path(fn)
         if not fn.exists():
             raise FileNotFoundError(f"File {fn} not found")
         # Calculate a CRC32 hash for the file
-        crc = f"{self.RAG_PREFIX}:{self.calculate_crc32(fn)}"
+        crc = f'{self.RAG_PREFIX}:{self.calculate_crc32(fn)}'
         # Query the database for the CRC
         if not overwrite and self._document_store.is_in(crc.split(":")[1]):
             logger.warning(f"File {fn} already in store")
             return
         # Obtain a new summariser instance
         sf = self.get_summariser()
-        # Now process the different elements separately
-        # Tables
-        logger.info("Extracting tables")
-        loader = UnstructuredPDFLoader(file_path=fn,
-                            strategy='hi_res',
-                            extract_images_in_pdf=True,
-                            infer_table_structure=True,
-                            mode='elements',
-                            extract_image_block_to_payload=False,                  # optional
-                            extract_image_block_output_dir=self.TMPDIR+"/"+crc
-                            )
-        data = loader.load()
-        logger.info(f"Tables extracted after {time.time() - start:.1f} seconds")
-        tables = [doc for doc in data if doc.metadata['category'] == 'Table']
-        # Texts
-        logger.info("Extracting text elements")
-        loader = UnstructuredPDFLoader(file_path=fn,
-                            strategy='hi_res',
-                            extract_images_in_pdf=True,
-                            infer_table_structure=True,
-                            chunking_strategy="by_title", # section-based chunking
-                            max_characters=4000, # max size of chunks
-                            new_after_n_chars=4000, # preferred size of chunks
-                            combine_text_under_n_chars=2000, # smaller chunks < 2000 chars will be combined into a larger chunk
-                            mode='elements',
-                            extract_image_block_to_payload=False,                  # optional
-                            extract_image_block_output_dir=self.TMPDIR+"/"+crc
-                            )
-        texts = loader.load()
-        logger.info(f"Texts extracted after {time.time() - start:.1f} seconds")
-        # Figures
-        # First find all figures that are not related to tables
-        logger.info("Extracting figures")
-        referenced_figures = [table.metadata['image_path'] for table in tables if 'image_path' in table.metadata.keys()]
-        figure_fns = [fn for fn in Path(self.TMPDIR+"/"+crc).glob('*') if fn not in referenced_figures]
-        figure_fns = self.reduce_image_size(figure_fns)
-        figures = [Document(page_content='', metadata={'category': 'Image', 'chunk-id': f'{crc}.fig{i}', 'image_path': figure_fn,
-                                        'page_number': 0, 'languages': ['eng']}) for i,figure_fn in enumerate(figure_fns)]
-        logger.info(f"Figures extracted after {time.time() - start:.1f} seconds")
-        logger.info("Summarising document")
-        sf.set_context(texts)
-        logger.info(f"Document summarised after {time.time() - start:.1f} seconds")
-        elements = texts + tables + figures
-        logger.info(f"File {fn} partitioned into {len(elements)} elements in {time.time() - start:.1f} seconds")
-        # Process each element based on its type
-        # for each :
-        # - Image
-        #   Create a summary and uuencode the image
-        # - Table, FigureCaption, NarrativeText
-        #   Create a summary
-        # - Title, Text
-        #   Use as is
-        # - Other
-        #   Ignore
-        # Then set metadata for the element:
-        #   - doc-id: the document hash crc
-        #   - chunk-id: the element id
-        #   - type: the element type
-        #   - source: the originating file name (no path)
-        #   - page_number: the page number
-        #   - languages: the languages detected in the element
-        # Documents are stored in the document store, summaries are stored in the vector store
-        documents = []
-        summaries = []
-
-        for i,element in enumerate(elements):
-            metadata = {
-                "doc-id": crc,
-                "source": fn.name,
-                "page_number": element.metadata['page_number'],
-                "languages": ",".join(element.metadata['languages']),
-                "type": element.metadata['category'],
-            }
-            if 'chunk-id' in element.metadata.keys():
-                metadata['chunk-id'] = element.metadata['chunk-id']
-            else:
-                metadata['chunk-id'] = f"{crc}.{i}"
-            summary = None
-            text = None
-            logger.info(f"Processing element {metadata['chunk-id']} of type {element.metadata['category']}")
-            match element.metadata['category']:
-                case 'Table':
-                    imagepath = None
-                    summary = sf.summarise_table(element.page_content, imagepath)
+        with open(fn, "rb") as f:
+            # Create a document summary as context for the elements
+            chunks = partition(file=f, chunking_strategy="by_title")
+            # Convert them to Document objects
+            chunks = [Document(page_content=chunk.text) for chunk in chunks]
+            sf.set_context(chunks)
+            # Now process the different elements separately        
+            elements = partition(file=f,
+                                strategy="hi_res",                                     # mandatory to use ``hi_res`` strategy
+                                extract_images_in_pdf=True,                            # mandatory to set as ``True``
+                                extract_image_block_types=["Image", "Table"],          # optional
+                                extract_image_block_to_payload=False,                  # optional
+                                extract_image_block_output_dir="./tmp",
+                                unique_element_ids=True)                               # gives globally unique element ids
+            logger.info(f"File {fn} partitioned into {len(elements)} elements in {time.time()-start:.1f} seconds")
+            # Process each element based on its type
+            # for each :
+            # - Image
+            #   Create a summary and uuencode the image
+            # - Table, FigureCaption, NarrativeText
+            #   Create a summary
+            # - Title, Text
+            #   Use as is
+            # - Other
+            #   Ignore
+            # Then set metadata for the element:
+            #   - doc-id: the document hash crc
+            #   - chunk-id: the element id
+            #   - type: the element type
+            #   - source: the originating file name (no path)
+            #   - page_number: the page number
+            #   - languages: the languages detected in the element
+            # Documents are stored in the document store, summaries are stored in the vector store
+            documents = []
+            summaries = []
+            
+            for element in elements:
+                metadata = {
+                    "doc-id": crc,
+                    "chunk-id": element.id,
+                    "source": fn.name,
+                    "page_number": element.metadata.page_number,
+                    "languages": ",".join(element.metadata.languages),
+                    "type": element.category
+                }
+                summary = None
+                text = None
+                logger.info(f"Processing element {element.id} of type {element.category}")
+                if isinstance(element, Table):
+                    imagepath = element.metadata.image_path
+                    summary = sf.summarise_table(element.text, imagepath)
                     if not summary:
-                        text = element.page_content
-                case 'Image':
-                    imagepath = element.metadata['image_path']
-                    summary = sf.summarise_image(None, imagepath)
+                        summary = element.text
+                    with open(imagepath, "rb") as image_file:
+                        text = base64.b64encode(image_file.read()).decode("utf-8")
+                elif isinstance(element, Image):
+                    imagepath = element.metadata.image_path
+                    summary = sf.summarise_image(element.text, imagepath)
                     if not summary:
-                        text = base64.b64encode(open(imagepath, "rb").read()).decode("utf-8")
-                case _:
-                    text = element.page_content
-                    if not text or len(text) == 0:
-                        continue # No point summarising or storing an empty element
-                    summary = sf.summarise_text(text)
+                        summary = element.text
+                    with open(imagepath, "rb") as image_file:
+                        text = base64.b64encode(image_file.read()).decode("utf-8")
+                elif isinstance(element, Title):
+                    summary = element.text
+                    text = element.text
+                elif isinstance(element, FigureCaption):
+                    summary = element.text
+                    text = element.text
+                elif isinstance(element, NarrativeText):
+                    summary = sf.summarise_text(element.text)
                     if not summary:
-                        summary = element.page_content
+                        summary = element.text
+                    text = element.text
+                elif isinstance(element, Text):
+                    summary = element.text
+                    text = element.text
+                else:
+                    # We don't care about the other types
+                    continue
+            
+                if summary:
+                    summaries.append(Document(page_content=summary, metadata=metadata))
 
-            if summary:
-                logger.info(f"Summary for element {metadata['chunk-id']} generated")
-                summaries.append(Document(page_content=summary, metadata=metadata))
-
-            if text:
-                document = metadata.copy()
-                document["content"] = text
-                document_id = f"{self.RAG_PREFIX}:{self.get_hash(text)}"
-                logger.info(f"Document with {metadata['chunk-id']} generated")
-                documents.append({"document_id": document_id, "document": document})
-        logger.info(
-            f"Processing of elements completed in {time.time() - start:.1f} seconds"
-        )
+                if text:
+                    document = metadata.copy()
+                    document['content'] = text
+                    document_id = f'{self.RAG_PREFIX}:{self.get_hash(text)}'
+                    documents.append({'document_id': document_id, 'document': document})
+        logger.info(f"Processing of elements completed in {time.time()-start:.1f} seconds")
         # We assume that the process of a round trip to the document store is cheap
         # compared with the partitioning
         if documents:
@@ -294,14 +252,9 @@ class RAGStore:
             self._vector_store.add(summaries)
         else:
             logger.warning(f"No summaries generated for file {fn}")
-        # Empty the TMPDIR folder before processing
-        if purge_folder:
-            if Path(self.TMPDIR).exists():
-                shutil.rmtree(self.TMPDIR)
-        
-        logger.info(f"Processing of file {fn} completed in {time.time() - start:.1f} seconds")
-
-    def add_folder(self, folder: str, recursive: bool = False):
+        logger.info(f"Processing of file {fn} completed in {time.time()-start:.1f} seconds")
+    
+    def add_folder(self, folder:str, recursive:bool=False):
         """
         Adds all files from the specified folder to the store.
         Args:
@@ -323,11 +276,9 @@ class RAGStore:
             files = [fn for fn in files if fn.is_file()]
         else:
             files = [fn for fn in folderpath.iterdir() if fn.is_file()]
-        # Remove any images that might have been left over
-        if Path(self.TMPDIR).exists():
-            shutil.rmtree(self.TMPDIR)
+        
         with ThreadPoolExecutor() as executor:
-            futures = {executor.submit(self.add_file, fn=fn, overwrite=False, purge_folder=False): fn for fn in files}
+            futures = {executor.submit(self.add_file, fn, False): fn for fn in files}
             for future in as_completed(futures):
                 fn = futures[future]
                 try:
@@ -335,11 +286,8 @@ class RAGStore:
                     logger.info(f"File {fn} processed")
                 except Exception as e:
                     logger.error(f"Error processing file {fn}: {e}")
-        # And clean up the TMPDIR folder
-        if Path(self.TMPDIR).exists():
-            shutil.rmtree(self.TMPDIR)
-        
-    def get_hash(self, text: str) -> str:
+
+    def get_hash(self, text:str)->str:
         """
         Generates a hash for the given text.
         Args:
@@ -348,8 +296,8 @@ class RAGStore:
             str: The hash of the text.
         """
         return hashlib.md5(text.encode()).hexdigest()
-
-    def calculate_crc32(self, file_path: str | Path) -> int:
+    
+    def calculate_crc32(self,file_path: str|Path)->int:
         """
         Calculate the CRC32 checksum of a file.
         Args:
@@ -363,43 +311,14 @@ class RAGStore:
             file_path = Path(file_path)
         if not file_path.exists():
             raise FileNotFoundError(f"File {file_path} not found")
-        with open(file_path, "rb") as file:
+        with open(file_path, 'rb') as file:
             while chunk := file.read(buffer_size):
                 crc = zlib.crc32(chunk, crc)
         return crc & 0xFFFFFFFF  # Ensure a consistent unsigned 32-bit result
 
-    def reduce_image_size(self, figure_fns:list, optimize:bool=True, quality:int=95)->List[str]:
-        """
-        Reduces the size of images to a maximum of 1024x1024 pixels.
-        Args:
-            figure_fns (list): List of image filenames.
-        Returns:
-            list: List of image filenames with reduced size.
-        """
-        reduced_fns = []
-        for fn in figure_fns:
-            try:
-                with Image.open(fn) as img:
-                    img_size = img.size
-                    pixels = img_size[0]*img_size[1]
-                    if pixels > self._imgsize:
-                        new_x = int(round(img_size[0]/np.sqrt(pixels/self._imgsize),0))
-                        new_y = int(round(img_size[1]/np.sqrt(pixels/self._imgsize),0))
-                        img = img.resize((new_x, new_y), Image.LANCZOS)
-                        reduced_fn = str(fn).replace(fn.suffix, f"_reduced{fn.suffix}")
-                    else:
-                        reduced_fn = str(fn)
-                        reduced_fns.append(fn)
-                    img.save(reduced_fn, optimize=optimize, quality=quality)
-                    reduced_fns.append(reduced_fn)
-            except Exception as e:
-                logger.error(f"Error reducing image {fn}: {e}")
-        # and return the new filenames
-        return reduced_fns  
 
-
-class OpenAISummariser:
-    """
+class OpenAISummariser():
+    '''
     A class to summarize text, tables, and images using OpenAI's language models for semantic retrieval.
     Attributes:
     -----------
@@ -433,8 +352,7 @@ class OpenAISummariser:
         Summarizes the given image using the image summary prompt.
     summarise(text: str, image_fn: str, prompt: ChatPromptTemplate) -> str:
         Summarizes the given text and/or image using the specified prompt.
-    """
-
+    '''
     SUMMARY_PROMPT_TEXT = """
         You are an assistant tasked with summarizing text particularly for semantic retrieval.
         These summaries will be embedded and used to retrieve the raw text. 
@@ -450,7 +368,7 @@ class OpenAISummariser:
         {context}
 
         """
-
+        
     SUMMARY_PROMPT_TABLE = """
         You are an assistant tasked with summarizing tables particularly for semantic retrieval.
         These summaries will be embedded and used to retrieve the table elements.
@@ -470,7 +388,7 @@ class OpenAISummariser:
         Context:
         {context}
         """
-
+    
     SUMMARY_PROMPT_IMAGE = """
         You are an assistant tasked with summarizing images for retrieval.
         Remember these images could potentially contain graphs, charts or tables also.
@@ -485,15 +403,15 @@ class OpenAISummariser:
         Context:
         {context}
         """
-
+        
     SYS_PROMPT = """Act as a helpful assistant and give brief answers"""
-
+    
     CONTEXT_WINDOW = {
-        "gpt-4o": 128000,
-        "gpt-4o-mini": 128000,
+        'gpt-4o': 128000,
+        'gpt-4o-mini': 128000,
     }
-
-    def __init__(self, model: str = "gpt-4o", debug: bool = False):
+    
+    def __init__(self, model:str='gpt-4o', debug:bool=False):
         """
         Initializes the Ragstore class.
         Args:
@@ -511,21 +429,21 @@ class OpenAISummariser:
         self._debug = debug
         self._context = None
         self._tokenizer = tiktoken.encoding_for_model(model)
-
-    def estimate_tokens(self, data) -> int:
+    
+    def estimate_tokens(self, data)->int:
         """
         Estimate the number of tokens in the given data.
-        This method takes a data object, which can be an instance of either
-        StringPromptValue or ChatPromptValue, and calculates the number of tokens
+        This method takes a data object, which can be an instance of either 
+        StringPromptValue or ChatPromptValue, and calculates the number of tokens 
         in the text content of the data using the tokenizer.
         Args:
-            data: An instance of either StringPromptValue or ChatPromptValue.
+            data: An instance of either StringPromptValue or ChatPromptValue. 
                     - If data is a StringPromptValue, the text attribute is used.
-                    - If data is a ChatPromptValue, the content of each message in
+                    - If data is a ChatPromptValue, the content of each message in 
                     the messages attribute is concatenated.
         Returns:
             int: The number of tokens in the provided data.
-        """
+        """        
         if isinstance(data, StringPromptValue):
             prompt = data.text
         elif isinstance(data, ChatPromptValue):
@@ -534,8 +452,8 @@ class OpenAISummariser:
                 msgs = data.messages
                 for msg in msgs:
                     prompt += msg.content
-        return len(self._tokenizer.encode(prompt))
-
+        return len(self._tokenizer.encode(prompt))           
+    
     def log_prompt(self, data):
         """
         Logs the final prompt data if debugging is enabled.
@@ -563,16 +481,12 @@ class OpenAISummariser:
             ValueError: If the token length exceeds 90% of the maximum context length.
         """
         length = self.estimate_tokens(data)
-        if length > int(0.9 * self._max_context_length):
-            logger.warning(
-                f"Prompt length {length} exceeds maximum {self._max_context_length}"
-            )
-            raise OpenAIError(
-                f"Prompt length {length} exceeds maximum {self._max_context_length}"
-            )
+        if length > int(0.9*self._max_context_length):
+            logger.warning(f"Prompt length {length} exceeds maximum {self._max_context_length}")
+            raise OpenAIError(f"Prompt length {length} exceeds maximum {self._max_context_length}")
         return data
 
-    def set_context(self, chunks: list):
+    def set_context(self, chunks:list):
         """
         Sets the context by summarizing the provided chunks using a summarization chain.
         Args:
@@ -588,7 +502,7 @@ class OpenAISummariser:
             self._context = chain.invoke(chunks)
             logger.info(f"Summarising the document costed {cb.total_tokens} tokens")
 
-    def summarise_text(self, text: str) -> str:
+    def summarise_text(self, text:str)->str:
         """
         Summarizes the given text using a predefined prompt template.
         Args:
@@ -599,7 +513,7 @@ class OpenAISummariser:
         prompt = PromptTemplate.from_template(self.SUMMARY_PROMPT_TEXT)
         return self.summarise(text=text, prompt=prompt)
 
-    def summarise_table(self, text: str, image_fn: str = None) -> str:
+    def summarise_table(self, text:str, image_fn:str = None)->str:
         """
         Summarizes the content of a table provided in text format.
         Args:
@@ -614,7 +528,7 @@ class OpenAISummariser:
             summary = self.summarise(text=text, prompt=prompt)
         return summary
 
-    def summarise_image(self, text: str, image_fn: str = None) -> str:
+    def summarise_image(self, text:str, image_fn:str = None)->str:
         """
         Summarizes the given text and optionally an image.
         Args:
@@ -629,9 +543,7 @@ class OpenAISummariser:
             summary = self.summarise(text=text, prompt=prompt)
         return summary
 
-    def summarise(
-        self, text: str, prompt: ChatPromptTemplate, image_fn: str | None = None
-    ) -> str:
+    def summarise(self, text:str, prompt: ChatPromptTemplate, image_fn:str|None=None)->str:
         """
         Summarizes the given text and optionally includes an image in the prompt.
         Args:
@@ -640,7 +552,7 @@ class OpenAISummariser:
             prompt (ChatPromptTemplate): The prompt template to be used for summarization.
         Returns:
             str: The summary of the given text.
-        """
+        """        
         image_base64 = ""
         if image_fn:
             with open(image_fn, "rb") as image_file:
@@ -648,7 +560,7 @@ class OpenAISummariser:
         # Steps for debugging and for token estimation
         debug_step = RunnableLambda(self.log_prompt)
         token_est_step = RunnableLambda(self.check_token_length)
-
+        
         ingestion = {}
         invocation = {}
         if "content" in prompt.input_variables:
@@ -660,14 +572,19 @@ class OpenAISummariser:
         if "context" in prompt.input_variables:
             ingestion["context"] = RunnablePassthrough()
             invocation["context"] = self._context
-
+        
         chain = (
-            ingestion
-            | prompt
-            | debug_step
-            | token_est_step
-            | self._llm
-            | StrOutputParser()
+            ingestion 
+                |
+            prompt
+                |
+            debug_step
+                |
+            token_est_step
+                |
+            self._llm
+                | 
+            StrOutputParser()
         )
 
         # Run the chain
@@ -678,7 +595,7 @@ class OpenAISummariser:
         return summary
 
     @retry(exceptions=(ValueError, RateLimitError), delay=2, retries=3)
-    def invoke(self, invocation: dict, chain: RunnablePassthrough) -> str:
+    def invoke(self, invocation:dict, chain:RunnablePassthrough)->str:
         """
         Invokes the chain with the specified invocation and returns the result.
         Args:
@@ -692,16 +609,16 @@ class OpenAISummariser:
         except RateLimitError as e:
             if "rate limit" in str(e):
                 logger.warning(f"Rate limit hit: {e}. Retrying...")
-                raise RateLimitError("Rate limit") from e  # to trigger a retry
+                raise RateLimitError("Rate limit") from e # to trigger a retry
         except OpenAIError as e:
             # Handle token-related or rate-limiting issues
             if "context length" in str(e).lower():
                 logger.error(f"Context length exceeded: {e}")
-                return ""  # Can't do anything about this, so return an empty string
-            elif (
-                "prompt length" in str(e).lower()
-            ):  # This is triggered by the check_token_length method
-                return ""  # Can't do anything about this, so return an empty string
+                return "" # Can't do anything about this, so return an empty string
+            elif "prompt length" in str(e).lower(): # This is triggered by the check_token_length method
+                return "" # Can't do anything about this, so return an empty string
             else:
                 logger.error(f"LLM-related error: {e}")
-                raise ValueError("LLM-related error") from e  # to trigger a retry
+                raise ValueError("LLM-related error") from e # to trigger a retry
+
+        

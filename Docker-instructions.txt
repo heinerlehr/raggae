@@ -1,0 +1,13 @@
+DOCKER INSTRUCTIONS
+
+
+BUILD:
+docker-compose build
+docker-compose up -d
+
+START
+docker-compose start
+
+STOP WITHOUT REMOVING
+docker-compose stop
+

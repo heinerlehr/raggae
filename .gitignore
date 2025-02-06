@@ -1,0 +1,30 @@
+# Python-generated files
+__pycache__/
+*.py[oc]
+build/
+dist/
+wheels/
+*.egg-info
+
+# Virtual environments
+.venv
+
+# DB
+db/
+.sqlite3
+.db
+.rdb
+tmp/
+nltk_data/
+.bash*
+.env
+.log
+.lock
+.python-version
+.ipython
+.vscode/
+.cache/
+.config/
+.devcontainer/
+
+
