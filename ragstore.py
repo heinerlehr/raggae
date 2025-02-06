@@ -207,6 +207,7 @@ class RAGStore:
         logger.info("Extracting figures")
         referenced_figures = [table.metadata['image_path'] for table in tables if 'image_path' in table.metadata.keys()]
         figure_fns = [fn for fn in Path(self.TMPDIR+"/"+crc).glob('*') if fn not in referenced_figures]
+        # Reduce images in size and provide the new filenames pointing to the reduced images
         figure_fns = self.reduce_image_size(figure_fns)
         figures = [Document(page_content='', metadata={'category': 'Image', 'chunk-id': f'{crc}.fig{i}', 'image_path': figure_fn,
                                         'page_number': 0, 'languages': ['eng']}) for i,figure_fn in enumerate(figure_fns)]
