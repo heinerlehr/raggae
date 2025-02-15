@@ -26,5 +26,5 @@ nltk_data/
 .cache/
 .config/
 .devcontainer/
-
+.log
 
