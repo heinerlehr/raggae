@@ -74,19 +74,18 @@ class DocumentStore():
 
     @retry(exceptions=(Exception,), delay=1, retries=3)    
     def add(self, documents:list[dict]):
-        def add(self, documents: list[dict]):
-            """
-            Adds a list of documents to the database.
-            Args:
-                documents (list[dict]): A list of dictionaries where each dictionary represents a document.
-                    Each dictionary should have the following structure:
-                    {
-                        'document_id': <unique identifier for the document>,
-                        'document': <dictionary containing the document data>
-                    }
-            Returns:
-                None
-            """
+        """
+        Adds a list of documents to the database.
+        Args:
+            documents (list[dict]): A list of dictionaries where each dictionary represents a document.
+                Each dictionary should have the following structure:
+                {
+                    'document_id': <unique identifier for the document>,
+                    'document': <dictionary containing the document data>
+                }
+        Returns:
+            None
+        """
         
         pipe = self._dbc.pipeline()
         for document in documents:
@@ -176,9 +175,11 @@ class DocumentStore():
         if filters:
             for field, value in filters.items():
                 if field == "languages":  # For TagField, use curly braces
-                    query = query.add_filter(f"@{field}:{{{value}}}")
-                else:
-                    query = query.add_filter(f"@{field}:{value}")
+                    query = f"@{field}:{{{value}}}"
+                elif isinstance(value, str):
+                    query = value.strip()
+                elif isinstance(value, list):
+                    query = '('+'|'.join([f"'{val.replace('-',' ').strip()}'" for val in value])+')'
 
         # Execute the search
         results = self._dbc.ft(index_name).search(query)
@@ -187,8 +188,8 @@ class DocumentStore():
         documents = []
         for doc in results.docs:
             documents.append({
-                "doc_id": doc.doc_id,
-                "chunk_id": doc.chunk_id,
+                "doc-id": doc['doc-id'],
+                "chunk-id": doc['chunk-id'],
                 "type": doc.type,
                 "source": doc.source,
                 "page_number": doc.page_number,

@@ -86,3 +86,6 @@ class VectorStore():
         else:
             logger.info(f"Chroma database directory '{persist_path}' does not exist.")
             return False
+
+    def get_db(self):
+        return self._db

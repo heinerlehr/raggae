@@ -2,12 +2,13 @@ import os
 # Logging
 from loguru import logger
 # Langchain
-from langchain_openai import ChatOpenAI, OpenAIEmbeddings
-from langchain_core.prompts import PromptTemplate, ChatPromptTemplate
+from langchain_openai import ChatOpenAI
+from langchain_core.prompts import ChatPromptTemplate
 from langchain_core.output_parsers import StrOutputParser
 from langchain_core.runnables import RunnablePassthrough, RunnableLambda
 from langchain_core.prompt_values import ChatPromptValue, StringPromptValue
-from langchain.memory import ChatMessageHistory, ChatMessage
+from langchain.schema import HumanMessage, AIMessage
+from langchain_community.chat_message_histories import ChatMessageHistory
 from openai import RateLimitError, OpenAIError
 # retry
 from retry import retry
@@ -17,6 +18,29 @@ from vector_store import VectorStore
 import tiktoken 
 
 class RAGQuery():
+    '''
+    RAGQuery class for handling retrieval-augmented generation queries.
+    Attributes:
+        FULL_PROMPT (str): Template for generating detailed answers using context and history.
+        KEYWORK_PROMPT (str): Template for extracting keywords from a query and context.
+        QUERY_RE_PROMPT (str): Template for re-formulating a query based on context and history.
+        HISTORY_SUMMARY_PROMPT (str): Template for summarizing chat history relevant to a query.
+        CONTEXT_WINDOW (dict): Dictionary mapping model names to their maximum context lengths.
+    Methods:
+        __init__(vector_store, document_store, llm='OpenAI', debug=False, model='gpt-4o', topk=5, n_kw=5):
+            Initializes the RAGQuery instance with the specified parameters.
+        query(query: str, n_kw: int = 5) -> str:
+            Processes a query to generate an answer using context, history, and keyword extraction.
+        get_history_summary(query: str) -> str:
+            Summarizes the chat history relevant to the given query.
+        estimate_tokens(data) -> int:
+            Estimates the number of tokens in the given data.
+        log_prompt(data):
+        check_token_length(data):
+        execute(query: str, prompt: ChatPromptTemplate, n_kw: str | None = None, context: str | None = None, history: str | None = None) -> str:
+            Executes the prompt chain to generate a summary or answer based on the given query, context, and history.
+        invoke(invocation: dict, chain: RunnablePassthrough) -> str:
+    '''
     
     FULL_PROMPT = '''
     You are an assistant who is an expert in question-answering tasks.
@@ -69,18 +93,41 @@ class RAGQuery():
         Concise Summary:
     '''
     
-    
-    def __init__(self, vector_store: VectorStore, document_store:DocumentStore, llm:str='OpenAI', debug:bool=False, model:str='gpt-4o', topk:int=5):
+    CONTEXT_WINDOW = {
+        "gpt-4o": 128000,
+        "gpt-4o-mini": 128000,
+    }
+
+    def __init__(self, vector_store: VectorStore, document_store:DocumentStore, llm:str='OpenAI', debug:bool=False, model:str='gpt-4o', topk:int=5, n_kw:int=5):
+        """
+        Initializes the RagQuery class.
+        Args:
+            vector_store (VectorStore): The vector store instance for similarity search.
+            document_store (DocumentStore): The document store instance for storing documents.
+            llm (str, optional): The type of language model to use. Defaults to 'OpenAI'.
+            debug (bool, optional): Flag to enable or disable debug mode. Defaults to False.
+            model (str, optional): The model name to use for the language model. Defaults to 'gpt-4o'.
+            topk (int, optional): The number of top similar documents to retrieve. Defaults to 5.
+            n_kw (int, optional): The number of keywords to use. Defaults to 5.
+        Raises:
+            ValueError: If the specified language model type is not supported.
+        """
+        
         self._debug = debug
         # LLM
         self._llm_type = llm
+        self._n_kw = n_kw
         match llm:
             case 'OpenAI':
                 self._llm = ChatOpenAI(model_name=model, temperature=0)
+                self._max_context_length = self.CONTEXT_WINDOW.get(model, 128000)
                 embedding_model = os.getenv("OPENAI_EMBEDDING_MODEL")
                 if not embedding_model:
                     embedding_model = 'text-embedding-3-small'
                 # embedding_function = OpenAIEmbeddings(model=embedding_model)
+            case _:
+                raise ValueError(f"LLM type {llm} not supported")
+            
         # Vector and document stores
         self._vector_store = vector_store
         self._document_store = document_store
@@ -90,46 +137,60 @@ class RAGQuery():
         self._history = ChatMessageHistory()
         self._tokenizer = tiktoken.encoding_for_model(model)
         
+        
     def query(self, query:str, n_kw:int=5)->str:
+        """
+        Processes a query to retrieve relevant documents, generate keywords, and reformulate the query based on history and context.
+        Args:
+            query (str): The input query string.
+            n_kw (int, optional): The number of keywords to generate. Defaults to 5.
+        Returns:
+            str: The final answer generated after processing the query.
+        """
         
         # Obtain relevant chunks from vector store
         documents = self._retriever.invoke(query)
         context = "\n".join([doc.page_content for doc in documents])
         # We'll need that later
-        chunk_ids = [doc.chunk_id for doc in documents]
+        chunk_ids = [doc.metadata['chunk-id'] for doc in documents]
         # Generate keywords from query and context
         kw_prompt = ChatPromptTemplate.from_template(self.KEYWORK_PROMPT)
-        kw_str = self.execute(query=query, prompt=kw_prompt, context=context)
+        kw_str = self.execute(query=query, prompt=kw_prompt, context=context, n_kw=self._n_kw)
         keywords = kw_str.split(",")
         
-    
         # Obtain relevant documents from document store via keyword search
         if keywords:
             docs = self._document_store.full_text_search(query, filters={"keywords": keywords})
-            context += "\n".join([doc.content for doc in docs if doc.chunk-id not in chunk_ids])
-            
+            context += "\n".join([doc['content'] for doc in docs if doc['chunk-id'] not in chunk_ids])
         
         # Obtain history and re-formulate query based on it and the context
         history = self.get_history_summary(query)
         re_query_prompt = ChatPromptTemplate.from_template(self.QUERY_RE_PROMPT)
         re_query = self.execute(query=query, prompt=re_query_prompt, context=context, history=history)
-        answer = self.execute(query=query, prompt=self.FULL_PROMPT.format(query=re_query, context=context), context=context)
+        re_query_prompt = ChatPromptTemplate.from_template(self.FULL_PROMPT)
+        answer = self.execute(query=re_query, prompt=re_query_prompt, context=context)
         
         # Add query and answer to the history
-        self._history.add_message(ChatMessage(type="human", content=re_query))
-        self._history.add_message(ChatMessage(type="ai", content=answer))
+        self._history.add_message(HumanMessage(content=re_query))
+        self._history.add_message(AIMessage(content=answer))
         
         # Return the answer
         return answer
     
     def get_history_summary(self, query:str)->str:
-        history = self._history.get_history()
+        """
+        Generates a summary of the history based on the provided query.
+        Args:
+            query (str): The query string to generate the history summary.
+        Returns:
+            str: The generated summary of the history.
+        """
         history_summary_prompt = ChatPromptTemplate.from_template(self.HISTORY_SUMMARY_PROMPT)
         
         formatted_history = "\n".join(
-            f"{msg.type.capitalize()}: {msg.content}" for msg in history.messages
+            f"{msg.type.capitalize()}: {msg.content}" for msg in self._history.messages
         )
-        summary = self.execute(query=query, prompt=history_summary_prompt, history=formatted_history)
+        summary = self.execute(query=query, n_kw=self._n_kw, prompt=history_summary_prompt, history=formatted_history)
         return summary
         
         
@@ -189,7 +250,7 @@ class RAGQuery():
             raise OpenAIError(f"Prompt length {length} exceeds maximum {self._max_context_length}")
         return data
             
-    def execute(self, query:str, prompt: ChatPromptTemplate, context:str|None=None, history:str|None=None)->str:
+    def execute(self, query:str, prompt: ChatPromptTemplate, n_kw:str|None=None, context:str|None=None, history:str|None=None)->str:
         """
         Summarizes the given text and optionally includes an image in the prompt.
         Args:
@@ -215,7 +276,10 @@ class RAGQuery():
         if "history" in prompt.input_variables:
             ingestion["history"] = RunnablePassthrough()
             invocation["history"] = history
-        
+        if "n_kw" in prompt.input_variables:
+            ingestion["n_kw"] = RunnablePassthrough()
+            invocation["n_kw"] = n_kw        
+
         chain = (
             ingestion 
                 |

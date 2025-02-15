@@ -29,9 +29,6 @@ from openai import OpenAIError, RateLimitError
 # Image management
 from PIL import Image
 
-# Unstructured
-from unstructured.partition.auto import partition
-
 from document_store import DocumentStore
 
 # retry
@@ -252,7 +249,8 @@ class RAGStore:
                 metadata['chunk-id'] = f"{crc}.{i}"
             summary = None
             text = None
-            logger.info(f"Processing element {metadata['chunk-id']} of type {element.metadata['category']}")
+            if self._debug:
+                logger.info(f"Processing element {metadata['chunk-id']} of type {element.metadata['category']}")
             match element.metadata['category']:
                 case 'Table':
                     imagepath = None
@@ -273,18 +271,19 @@ class RAGStore:
                         summary = element.page_content
 
             if summary:
-                logger.info(f"Summary for element {metadata['chunk-id']} generated")
+                if self._debug:
+                    logger.info(f"Summary for element {metadata['chunk-id']} generated")
                 summaries.append(Document(page_content=summary, metadata=metadata))
 
             if text:
                 document = metadata.copy()
                 document["content"] = text
                 document_id = f"{self.RAG_PREFIX}:{self.get_hash(text)}"
-                logger.info(f"Document with {metadata['chunk-id']} generated")
+                if self._debug:
+                    logger.info(f"Document with {metadata['chunk-id']} generated")
                 documents.append({"document_id": document_id, "document": document})
-        logger.info(
-            f"Processing of elements completed in {time.time() - start:.1f} seconds"
-        )
+        if self._debug:
+            logger.info(f"Processing of elements completed in {time.time() - start:.1f} seconds")
         # We assume that the process of a round trip to the document store is cheap
         # compared with the partitioning
         if documents:
@@ -585,8 +584,10 @@ class OpenAISummariser:
         """
         with get_openai_callback() as cb:
             # Load the summarization chain with map_reduce
-            chain = load_summarize_chain(self._llm, chain_type="map_reduce")
-            self._context = chain.invoke(chunks)
+            chain = load_summarize_chain(self._llm, chain_type="stuff")
+            response = chain.invoke(chunks)
+            if response and 'output_text' in response.keys():
+                self._context = response['output_text']
             logger.info(f"Summarising the document costed {cb.total_tokens} tokens")
 
     def summarise_text(self, text: str) -> str:
